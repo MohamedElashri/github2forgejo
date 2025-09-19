@@ -2,9 +2,10 @@
 # GitHub -> Forgejo migrator (safe, non-destructive)
 # - Authenticated GitHub API (GITHUB_TOKEN required)
 # - No deletions
-# - Mirror or one-time clone
+# - Mirror (continuous) or one-time clone
 # - Optional .env loading
 # - Optional cron install
+# - Optional forced sync of existing mirrors or all processed mirrors
 
 set -Eeuo pipefail
 IFS=$' \t\n'
@@ -14,6 +15,10 @@ DEFAULT_STRATEGY="mirror"     # mirror|clone
 ENV_FILE=""
 INSTALL_CRON_DEFAULT="false"
 CRON_SCHEDULE_DEFAULT="0 2 * * *"
+
+# sync options (new)
+SYNC_EXISTING_DEFAULT="false"   # when 409, force sync that repo
+SYNC_ALL_AFTER_DEFAULT="false"  # after loop, force sync all processed mirrors
 
 # -------- utils --------
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -45,6 +50,8 @@ Usage: $0 [options]
   --env FILE                  Optional .env (KEY=VALUE)
   --install-cron              Install a cron to run this script
   --cron-schedule "CRON"      Cron expression (default: "0 2 * * *")
+  --sync-existing             On 409 (exists), force-sync that mirror now (mirror mode only)
+  --sync-all-after            After processing, force-sync all processed mirrors (mirror mode only)
   -h, --help                  Show help
 
 Required env (can be in .env):
@@ -52,7 +59,8 @@ Required env (can be in .env):
   FORGEJO_TOKEN  Forgejo token (create/import repos)
 
 Optional env:
-  GITHUB_USER, FORGEJO_URL, FORGEJO_USER, STRATEGY, CRON_SCHEDULE, INSTALL_CRON
+  GITHUB_USER, FORGEJO_URL, FORGEJO_USER, STRATEGY, CRON_SCHEDULE, INSTALL_CRON,
+  SYNC_EXISTING, SYNC_ALL_AFTER
 USAGE
 }
 
@@ -63,6 +71,8 @@ FJ_USER_CLI=""
 STRATEGY_CLI=""
 INSTALL_CRON_CLI=""
 CRON_SCHEDULE_CLI=""
+SYNC_EXISTING_CLI=""
+SYNC_ALL_AFTER_CLI=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,6 +83,8 @@ while [ $# -gt 0 ]; do
     --env) ENV_FILE="${2:-}"; shift 2 ;;
     --install-cron) INSTALL_CRON_CLI="true"; shift ;;
     --cron-schedule) CRON_SCHEDULE_CLI="${2:-}"; shift 2 ;;
+    --sync-existing) SYNC_EXISTING_CLI="true"; shift ;;
+    --sync-all-after) SYNC_ALL_AFTER_CLI="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
   esac
@@ -88,7 +100,7 @@ if [ -n "$ENV_FILE" ]; then
         key="$(trim "${line%%=*}")"
         val="$(trim "${line#*=}")"
         case "$key" in
-          GITHUB_TOKEN|FORGEJO_TOKEN|GITHUB_USER|FORGEJO_URL|FORGEJO_USER|STRATEGY|CRON_SCHEDULE|INSTALL_CRON)
+          GITHUB_TOKEN|FORGEJO_TOKEN|GITHUB_USER|FORGEJO_URL|FORGEJO_USER|STRATEGY|CRON_SCHEDULE|INSTALL_CRON|SYNC_EXISTING|SYNC_ALL_AFTER)
             export "$key=$val"
           ;;
         esac
@@ -109,6 +121,12 @@ INSTALL_CRON_IN="$(trim "${INSTALL_CRON_CLI:-${INSTALL_CRON:-$INSTALL_CRON_DEFAU
 INSTALL_CRON="$(echo "$INSTALL_CRON_IN" | tr '[:upper:]' '[:lower:]')"
 
 CRON_SCHEDULE="$(trim "${CRON_SCHEDULE_CLI:-${CRON_SCHEDULE:-$CRON_SCHEDULE_DEFAULT}}")"
+
+SYNC_EXISTING_IN="$(trim "${SYNC_EXISTING_CLI:-${SYNC_EXISTING:-$SYNC_EXISTING_DEFAULT}}")"
+SYNC_EXISTING="$(echo "$SYNC_EXISTING_IN" | tr '[:upper:]' '[:lower:]')"
+
+SYNC_ALL_AFTER_IN="$(trim "${SYNC_ALL_AFTER_CLI:-${SYNC_ALL_AFTER:-$SYNC_ALL_AFTER_DEFAULT}}")"
+SYNC_ALL_AFTER="$(echo "$SYNC_ALL_AFTER_IN" | tr '[:upper:]' '[:lower:]')"
 
 # -------- prompts (only if missing); tokens hidden --------
 prompt_secret() {
@@ -158,17 +176,56 @@ case "$INSTALL_CRON" in
   *) INSTALL_CRON="false" ;;
 esac
 
+case "$SYNC_EXISTING" in
+  true|false) ;;
+  *) SYNC_EXISTING="false" ;;
+esac
+
+case "$SYNC_ALL_AFTER" in
+  true|false) ;;
+  *) SYNC_ALL_AFTER="false" ;;
+esac
+
 echo "${grn}Config:${rst} GH_USER=$GH_USER, FJ_USER=$FJ_USER, STRATEGY=$STRATEGY"
 echo "${ylw}Mode:${rst} non-destructive (no deletes)"
 
 # -------- HTTP helpers --------
+# keep --fail for GET-like requests
 ccurl() { curl --fail --show-error -sS "$@"; }
+
 gh_api() {
   ccurl -H "Authorization: Bearer ${GITHUB_TOKEN}" \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" "$@"
 }
-fj_api() { ccurl -H "Authorization: token ${FORGEJO_TOKEN}" "$@"; }
+
+# POST that captures http status and body (no --fail)
+post_json_with_status() {
+  local url="$1"; local data="$2"; local tmp code
+  tmp="$(mktemp)"
+  code="$(curl -sS -H "Authorization: token ${FORGEJO_TOKEN}" \
+               -H "Content-Type: application/json" \
+               -d "$data" "$url" \
+               -o "$tmp" -w "%{http_code}")"
+  POST_STATUS="$code"
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+# force-sync a mirror now
+sync_mirror_now() {
+  local owner="$1" repo="$2" tmp code
+  tmp="$(mktemp)"
+  code="$(curl -sS -X POST -H "Authorization: token ${FORGEJO_TOKEN}" \
+               "${FJ_URL}/api/v1/repos/${owner}/${repo}/mirror-sync" \
+               -o "$tmp" -w "%{http_code}")"
+  rm -f "$tmp"
+  if [ "$code" = "200" ]; then
+    echo "sync-ok"
+  else
+    echo "sync-err(${code})"
+  fi
+}
 
 # -------- fetch repos (owned by GH_USER) --------
 echo "${cyn}Fetching GitHub repositories for ${GH_USER}...${rst}"
@@ -190,6 +247,8 @@ repo_count="$(echo "$all_repos" | jq 'length')"
 echo "${grn}Found ${repo_count} repositories.${rst}"
 
 # -------- migrate each --------
+processed_repos=()
+
 echo "$all_repos" | jq -c '.[]' | while read -r repo; do
   name="$(echo "$repo" | json '.name')"
   full_name="$(echo "$repo" | json '.full_name')"
@@ -197,7 +256,6 @@ echo "$all_repos" | jq -c '.[]' | while read -r repo; do
   clone_url="$(echo "$repo" | json '.clone_url')" # https://github.com/OWNER/REPO.git
   mirror=true; [ "$STRATEGY" = "clone" ] && mirror=false
 
-  # Pass auth via payload, not in URL.
   payload="$(jq -n \
     --arg addr "$clone_url" \
     --arg owner "$FJ_USER" \
@@ -217,16 +275,51 @@ echo "$all_repos" | jq -c '.[]' | while read -r repo; do
     }')"
 
   printf "%s" "${cyn}Migrating ${full_name} -> ${FJ_URL}/${FJ_USER}/${name} (${STRATEGY})...${rst} "
-  resp="$(fj_api -H "Content-Type: application/json" -d "$payload" "${FJ_URL}/api/v1/repos/migrate" || true)"
-  msg="$(echo "$resp" | jq -r '.message // empty')"
-  if [[ "$msg" == *"already exists"* ]] || [[ "$msg" == *"exists"* ]]; then
-    echo "${ylw}exists${rst}"
-  elif [ -n "$msg" ]; then
-    echo "${red}error: ${msg}${rst}"
-  else
-    echo "${grn}ok${rst}"
-  fi
+  body="$(post_json_with_status "${FJ_URL}/api/v1/repos/migrate" "$payload")"
+  code="$POST_STATUS"
+  msg="$(echo "$body" | jq -r '.message // empty' 2>/dev/null || true)"
+
+  case "$code" in
+    201)
+      echo "${grn}ok${rst}"
+      processed_repos+=("${FJ_USER}:${name}")
+      ;;
+    409)
+      if [ "$SYNC_EXISTING" = "true" ] && [ "$STRATEGY" = "mirror" ]; then
+        res="$(sync_mirror_now "${FJ_USER}" "${name}")"
+        if [[ "$res" == sync-ok* ]]; then
+          echo "${ylw}exists, synced${rst}"
+        else
+          echo "${ylw}exists${rst} (${res})"
+        fi
+      else
+        echo "${ylw}exists${rst}"
+      fi
+      processed_repos+=("${FJ_USER}:${name}")
+      ;;
+    *)
+      if [ -n "$msg" ]; then
+        echo "${red}error (${code}): ${msg}${rst}"
+      else
+        echo "${red}error (${code})${rst}"
+      fi
+      ;;
+  esac
 done
+
+# -------- optional sync-all-after --------
+if [ "$SYNC_ALL_AFTER" = "true" ] && [ "$STRATEGY" = "mirror" ]; then
+  echo "${cyn}Forcing sync on processed mirrors...${rst}"
+  for entry in "${processed_repos[@]}"; do
+    owner="${entry%%:*}"; repo="${entry##*:}"
+    res="$(sync_mirror_now "$owner" "$repo")"
+    if [[ "$res" == sync-ok* ]]; then
+      echo "  ${owner}/${repo}: ok"
+    else
+      echo "  ${owner}/${repo}: ${res}"
+    fi
+  done
+fi
 
 # -------- optional cron --------
 if [ "$INSTALL_CRON" = "true" ]; then
